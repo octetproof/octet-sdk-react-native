@@ -1,0 +1,152 @@
+# Stage 2 of the React Native release.
+#
+# AUTHORED IN THE PRIVATE SOURCE REPO at
+# wrappers/react-native/dist/publish-npm.yml and mirrored verbatim to
+# .github/workflows/publish-npm.yml by release-react-native.yml. Do not edit it
+# here — the next release overwrites it. Same rule as the mirrored docs.
+#
+# WHY A SECOND STAGE AT ALL. npm trusted publishing (OIDC) and
+# `npm publish --provenance` both require the publishing workflow to run in a
+# PUBLIC repository. The source repo is private, so publishing has to happen
+# here. The trade is deliberate: this repo holds NO secrets — the OIDC identity
+# is minted per-run by GitHub and exchanged with npm, so there is no long-lived
+# npm token anywhere in the org.
+#
+# THIS JOB DOES NOT BUILD. It verifies a signed artifact that stage 1 produced
+# and publishes it. Rebuilding here would break the chain: the thing npm
+# receives would no longer be the thing that was signed.
+#
+# Trusted publishing must be configured once on npmjs.com for
+# @octetproof/react-native, pointing at THIS repo and THIS workflow filename.
+
+name: Publish to npm
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (e.g. 0.1.0)'
+        required: true
+      dry_run:
+        description: 'Verify everything, then stop short of publishing'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  # Mints the OIDC token npm exchanges for a short-lived publish credential,
+  # and the same token backs `--provenance`. No secrets are used by this job.
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Resolve release tag
+        id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.event.inputs.tag || github.event.release.tag_name }}"
+          [ -n "$TAG" ] || { echo "::error::no release tag resolved"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Publishing $TAG"
+
+      - name: Download the signed release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dl && cd dl
+          gh release download "${{ steps.rel.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern '*.tgz' \
+            --pattern 'SHASUMS256.txt' \
+            --pattern 'SHASUMS256.txt.sig' \
+            --pattern 'SHASUMS256.txt.pem'
+          ls -la
+
+      - name: Verify the checksum manifest
+        working-directory: dl
+        run: sha256sum -c SHASUMS256.txt
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          # Must match the version stage 1 signed with: v3+/v4 default to the
+          # new bundle format and cannot read a detached .sig/.pem pair.
+          cosign-release: 'v2.2.4'
+
+      - name: Verify the signature came from our release workflow
+        working-directory: dl
+        # The identity regexp is the actual control here. Without it, cosign
+        # would accept a manifest signed by ANY GitHub Actions workflow —
+        # verification would prove "something on GitHub signed this", not
+        # "our release pipeline signed this".
+        run: |
+          cosign verify-blob \
+            --certificate SHASUMS256.txt.pem \
+            --signature   SHASUMS256.txt.sig \
+            --certificate-identity-regexp 'https://github\.com/octetproof/octet-sdk/\.github/workflows/release-react-native\.yml@' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            SHASUMS256.txt
+
+      - name: Tarball version must match the release tag
+        working-directory: dl
+        run: |
+          TGZ=$(ls ./*.tgz)
+          VER=$(tar -xzOf "$TGZ" package/package.json | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).version")
+          if [ "$VER" != "${{ steps.rel.outputs.tag }}" ]; then
+            echo "::error::tarball is $VER but the release tag is ${{ steps.rel.outputs.tag }}"
+            exit 1
+          fi
+          echo "tarball version: $VER"
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      # Last gate before the irreversible act. npm publish cannot be undone:
+      # unpublish is restricted after 72h and a version number can never be
+      # reused, so a double-publish attempt must fail here rather than there.
+      - name: Version must not already exist on npm
+        run: |
+          PKG=@octetproof/react-native
+          if npm view "$PKG@${{ steps.rel.outputs.tag }}" version >/dev/null 2>&1; then
+            echo "::error::$PKG@${{ steps.rel.outputs.tag }} is already published — versions are never reusable"
+            exit 1
+          fi
+          echo "$PKG@${{ steps.rel.outputs.tag }} is unpublished; proceeding"
+
+      - name: Publish
+        working-directory: dl
+        run: |
+          TGZ=$(ls ./*.tgz)
+
+          # npm defaults to `--tag latest` and does NOT special-case a
+          # prerelease version. Published bare, `0.1.0-rc.1` becomes what a
+          # plain `npm install @octetproof/react-native` resolves to — which
+          # would make the throwaway dry-run tag that claude-specs/30 §4
+          # requires the very thing that breaks every consumer.
+          #
+          # Derive it instead: a semver prerelease is exactly a version with a
+          # hyphen after the patch, so `rn-v0.1.0-rc.1` -> next, `rn-v0.1.0` ->
+          # latest. A dist-tag is cheap to move afterwards; `latest` pointing at
+          # an RC in the window before someone notices is not.
+          case "${{ steps.rel.outputs.tag }}" in
+            *-*) DIST_TAG=next ;;
+            *)   DIST_TAG=latest ;;
+          esac
+          echo "publishing ${{ steps.rel.outputs.tag }} under dist-tag: $DIST_TAG"
+
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            echo "DRY RUN — everything above passed; not publishing."
+            npm publish "$TGZ" --provenance --access public --tag "$DIST_TAG" --dry-run
+          else
+            npm publish "$TGZ" --provenance --access public --tag "$DIST_TAG"
+          fi

@@ -1,0 +1,21 @@
+{
+  "expo": {
+    "name": "Octet RN Sample",
+    "slug": "octet-rn-sample",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "ios": {
+      "bundleIdentifier": "com.octetproof.rnsample",
+      "supportsTablet": false
+    },
+    "android": {
+      "package": "com.octetproof.rnsample"
+    },
+    "plugins": [
+      "@octetproof/react-native",
+      "./plugins/withSceneLifecycle"
+    ]
+  }
+}
