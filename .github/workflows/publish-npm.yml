@@ -111,6 +111,16 @@ jobs:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
 
+      # Trusted publishing (OIDC) needs npm 11.5.1 or newer. Node 22 bundles npm 10, which
+      # never tries the OIDC exchange: it sends setup-node's placeholder token and npm
+      # answers 404 on the PUT (the 0.1.0 publish failed exactly so). Pinned, not "latest".
+      - name: npm with trusted publishing
+        run: |
+          npm install -g npm@11.6.2
+          v=$(npm --version)
+          echo "npm $v"
+          printf '%s\n' 11.5.1 "$v" | sort -V -C || { echo "::error::npm $v is older than 11.5.1"; exit 1; }
+
       # Last gate before the irreversible act. npm publish cannot be undone:
       # unpublish is restricted after 72h and a version number can never be
       # reused, so a double-publish attempt must fail here rather than there.
